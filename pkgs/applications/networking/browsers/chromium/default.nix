@@ -3,7 +3,6 @@
   config,
   stdenv,
   makeWrapper,
-  buildPackages,
   ed,
   gnugrep,
   coreutils,
@@ -40,7 +39,6 @@
 let
   stdenv = pkgs.rustc.llvmPackages.stdenv;
 
-  # Helper functions for changes that depend on specific versions:
   warnObsoleteVersionConditional =
     min-version: result:
     let
@@ -104,13 +102,14 @@ let
   chromiumWV =
     let
       browser = chromium.browser;
+      pkgName = chromium.browser.packageName;
     in
     if enableWideVine then
       runCommand (browser.name + "-wv") { version = browser.version; } ''
         mkdir -p $out
         cp -a ${browser}/* $out/
-        chmod u+w $out/libexec/chromium
-        cp -a ${widevine-cdm}/share/google/chrome/WidevineCdm $out/libexec/chromium/
+        chmod u+w $out/libexec/${pkgName}
+        cp -a ${widevine-cdm}/share/google/chrome/WidevineCdm $out/libexec/${pkgName}/
       ''
     else
       browser;
@@ -131,10 +130,8 @@ stdenv.mkDerivation {
     glib
     gtk3
     gtk4
-
     # needed for XDG_ICON_DIRS
     adwaita-icon-theme
-
     # Needed for kerberos at runtime
     libkrb5
   ];
@@ -146,7 +143,7 @@ stdenv.mkDerivation {
 
   buildCommand =
     let
-      browserBinary = "${chromiumWV}/libexec/chromium/chromium";
+      browserBinary = "${chromiumWV}/libexec/${chromium.browser.packageName}/${chromium.browser.packageName}";
       libPath = lib.makeLibraryPath [
         libva
         pipewire
@@ -155,7 +152,7 @@ stdenv.mkDerivation {
         gtk4
         libkrb5
       ];
-      browserName = if variant == "helium" then "helium" else "chromium";
+      browserName = chromium.browser.packageName;
       defaultDataDir = if browserName == "helium" then "net.imput.helium" else browserName;
     in
     ''
@@ -163,7 +160,7 @@ stdenv.mkDerivation {
 
       makeWrapper "${browserBinary}" "$out/bin/${browserName}" \
         --add-flags "\''${NIXOS_OZONE_WL:+\''${WAYLAND_DISPLAY:+--ozone-platform-hint=auto --enable-features=WaylandWindowDecorations --enable-wayland-ime=true}}" \
-        --add-flags "--user-data-dir=\''${CHROME_USER_DATA_DIR:-\''${CHROME_CONFIG_HOME:-\''${XDG_CONFIG_HOME:-\''${HOME}/.config}}/${defaultDataDir}}" \
+        --add-flags "--user-data-dir=\''${CHROME_USER_DATA_DIR:-\''${CHROME_CONFIG_HOME:-\''${XDG_CONFIG_HOME:-\''${HOME}/.config}}}/${defaultDataDir}" \
         --add-flags ${lib.escapeShellArg commandLineArgs}
 
       ed -v -s "$out/bin/${browserName}" << EOF

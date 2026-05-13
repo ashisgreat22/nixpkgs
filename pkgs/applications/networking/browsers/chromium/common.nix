@@ -2,7 +2,6 @@
   stdenv,
   lib,
   fetchpatch,
-  fetchurl,
   zstd,
   fetchFromGitiles,
   fetchNpmDeps,
@@ -94,9 +93,10 @@
   proprietaryCodecs ? true,
   pulseSupport ? false,
   libpulseaudio ? null,
-  variant ? "chromium", # Can be chromium, ungoogled, or helium
+  variant ? "chromium",
   ungoogled-chromium,
   helium,
+  unzip,
   # Optional dependencies:
   libgcrypt ? null, # cupsSupport
   systemdSupport ? lib.meta.availableOn stdenv.hostPlatform systemdLibs,
@@ -116,6 +116,8 @@ let
       ply
       jinja2
       setuptools
+    ] ++ lib.optionals (variant == "helium") [
+      pillow
     ]
   );
 
@@ -192,9 +194,11 @@ let
     inherit helium;
   };
 
-  ungoogler = ungooglers.${variant} {
+  ungoogler = ungooglers.${variant} ({
     inherit (upstream-info.deps.ungoogled-patches) rev hash;
-  };
+  } // lib.optionalAttrs (variant == "helium") {
+    inherit (upstream-info.deps) helium-linux helium-onboarding helium-ublock helium-search-engines-data;
+  });
 
   # There currently isn't a (much) more concise way to get a stdenv
   # that uses lld as its linker without bootstrapping pkgsLLVM; see
@@ -334,6 +338,7 @@ let
       buildPackages.rustc.llvmPackages.bintools
       bison
       gperf
+      unzip
     ]
     ++ lib.optionals (!isElectron) [
       nodejs
@@ -477,7 +482,7 @@ let
       # Optional patch to use SOURCE_DATE_EPOCH in compute_build_timestamp.py (should be upstreamed):
       ./patches/no-build-timestamps.patch
     ]
-    ++ lib.optionals (packageName == "chromium") [
+    ++ lib.optionals (packageName == "chromium" || packageName == "helium") [
       # This patch is limited to chromium and ungoogled-chromium because electron-source sets
       # enable_widevine to false.
       #
@@ -641,7 +646,64 @@ let
     ++ lib.optionals (chromiumVersionAtLeast "147" && lib.versionOlder llvmVersion "23") [
       # clang++: error: unknown argument: '-fno-lifetime-dse'
       ./patches/chromium-147-llvm-22.patch
+    ]
+    ++ lib.optionals (chromiumVersionAtLeast "148" && lib.versionOlder llvmVersion "23") [
+      (fetchpatch {
+        name = "chromium-148-revert-build-Add--fsanitizer=return-config.patch";
+        url = "https://chromium.googlesource.com/chromium/src/+/99ba1f5302f9433efdb4df302cb7b7de56c72e4c^!?format=TEXT";
+        decode = "base64 -d";
+        revert = true;
+        hash = "sha256-/qzzxwTdPMwIdsqD/G02S7kKHCj3QxECL+g1WYEaWmU=";
+      })
+      (fetchpatch {
+        name = "chromium-148-revert-build-Enable--fsanitizer=return-config.patch";
+        url = "https://chromium.googlesource.com/chromium/src/+/9357bfbea03753fe52264c9ec36abe74f48cfef5^!?format=TEXT";
+        decode = "base64 -d";
+        revert = true;
+        hash = "sha256-14fTHNh3vGsf4KgeH8uLX+aK3lrjK0VKd1dfK1g7r0I=";
+      })
+      (fetchpatch {
+        name = "archlinux-chromium-146-drop-unknown-clang-flag.patch";
+        url = "https://gitlab.archlinux.org/archlinux/packaging/packages/chromium/-/raw/148.0.7778.96-1/chromium-146-drop-unknown-clang-flag.patch";
+        hash = "sha256-jR0G9z2R8VGl2tkB3u0368RyWM1J6qYXqNWwKkYd5zU=";
+      })
+    ]
+    ++ lib.optionals (chromiumVersionAtLeast "148") [
+      (fetchpatch {
+        name = "chromium-148-revert-Reland-build-use-tool-inputs-instead-of-siso-config-for-rust-actions.patch";
+        url = "https://chromium.googlesource.com/chromium/src/+/9193ab90af24c23ee983e0a8da9bed45712f0d26^!?format=TEXT";
+        decode = "base64 -d";
+        revert = true;
+        hash = "sha256-7xg8IZ2gO+Wtnv7lWLVE3lLpcmMgvtDtcWwUuMBzkrE=";
+      })
     ];
+
+    prePatch = lib.optionalString (variant == "helium") ''
+      mkdir -p components/helium_onboarding
+      tar xzf ${ungoogler}/helium-onboarding -C components/helium_onboarding --strip-components=1
+
+      mkdir -p third_party/ublock
+      unzip -q ${ungoogler}/helium-ublock -d /tmp/ublock-extract
+      cp -r /tmp/ublock-extract/uBlock0.chromium/* third_party/ublock/
+      rm -rf /tmp/ublock-extract
+
+      mkdir -p third_party/search_engines_data/resources_internal
+      tar xzf ${ungoogler}/helium-search-engines-data -C third_party/search_engines_data/resources_internal --strip-components=1
+
+      while IFS= read -r patch_name; do
+        case "$patch_name" in
+          '#'*) continue ;;
+          "") continue ;;
+        esac
+        patch -p1 --fuzz=2 --no-backup-if-mismatch \
+          -i "${ungoogler}/patches/$patch_name"
+      done < "${ungoogler}/patches/series"
+
+      for patch_file in ${ungoogler}/helium-linux/patches/helium/linux/*.patch; do
+        patch -p1 --fuzz=2 --no-backup-if-mismatch \
+          -i "$patch_file"
+      done
+    '';
 
     postPatch =
       # TODO: reuse mkGnFlags for this
@@ -753,8 +815,8 @@ let
         patchShebangs .
       ''
       + lib.optionalString isUngoogled ''
-        # Prune binaries (ungoogled only) *before* linking our own binaries:
-        ${ungoogler}/utils/prune_binaries.py . ${ungoogler}/pruning.list || echo "some errors"
+        # Prune binaries (ungoogled and helium only) *before* linking our own binaries:
+        python3 ${ungoogler}/utils/prune_binaries.py . ${ungoogler}/pruning.list || echo "some errors"
       ''
       + ''
         # Link to our own Node.js and Java (required during the build):
@@ -766,20 +828,38 @@ let
         sed -i 's/OFFICIAL_BUILD/GOOGLE_CHROME_BUILD/' tools/generate_shim_headers/generate_shim_headers.py
 
       ''
+      + lib.optionalString (chromiumVersionAtLeast "148") ''
+        mkdir -p third_party/gperf/cipd/bin
+        ln -s "${pkgsBuildHost.gperf}/bin/gperf" third_party/gperf/cipd/bin/gperf
+      ''
       +
         lib.optionalString (stdenv.hostPlatform == stdenv.buildPlatform && stdenv.hostPlatform.isAarch64)
           ''
             substituteInPlace build/toolchain/linux/BUILD.gn \
               --replace 'toolprefix = "aarch64-linux-gnu-"' 'toolprefix = ""'
           ''
-      + lib.optionalString isUngoogled ''
+      + lib.optionalString (variant == "ungoogled") ''
         ${ungoogler}/utils/patches.py . ${ungoogler}/patches
         ${ungoogler}/utils/domain_substitution.py apply -r ${ungoogler}/domain_regex.list -f ${ungoogler}/domain_substitution.list -c ./ungoogled-domsubcache.tar.gz .
       ''
       + lib.optionalString (variant == "helium") ''
-        ${ungoogler}/utils/name_substitution.py --sub -t .
-        ${ungoogler}/utils/helium_version.py --tree ${ungoogler} --chromium-tree .
-        ${ungoogler}/utils/replace_resources.py ${ungoogler}/resources/helium_resources.txt ${ungoogler}/resources .
+        python3 ${ungoogler}/utils/domain_substitution.py apply -r ${ungoogler}/domain_regex.list -f ${ungoogler}/domain_substitution.list -c ./helium-domsubcache.tar.gz .
+
+        export PYTHONPATH="${ungoogler}/utils:$PYTHONPATH"
+        python3 ${ungoogler}/utils/name_substitution.py --sub -t . --workers $NIX_BUILD_CORES
+
+        python3 ${ungoogler}/utils/i18n_apply.py -t .
+
+        python3 ${ungoogler}/utils/helium_version.py --tree ${ungoogler} --chromium-tree .
+        echo "HELIUM_PLATFORM=0" >> chrome/VERSION
+
+        cp -r ${ungoogler}/resources helium-resources
+        chmod -R u+w helium-resources
+        python3 ${ungoogler}/utils/generate_resources.py helium-resources/generate_resources.txt helium-resources
+
+        python3 ${ungoogler}/utils/replace_resources.py helium-resources/helium_resources.txt helium-resources .
+
+        unset PYTHONPATH
       '';
 
     # Sadly, Chromium is not even -fstrict-flex-array=1 clean
@@ -852,7 +932,7 @@ let
         use_gio = true;
         use_cups = cupsSupport;
       }
-      // lib.optionalAttrs (packageName == "chromium") {
+      // lib.optionalAttrs (packageName == "chromium" || packageName == "helium") {
         # Enabling the Widevine here doesn't affect whether we can redistribute the chromium package.
         # Widevine in this drv is a bit more complex than just that. See Widevine patch somewhere above.
         enable_widevine = true;
@@ -924,6 +1004,9 @@ let
       # but lit_reactive_element.patch only patches the former.
       + lib.optionalString (chromiumVersionAtLeast "146") ''
         rm -r third_party/node/node_modules/@lit/reactive-element/development
+      ''
+      + lib.optionalString (chromiumVersionAtLeast "148") ''
+        rm -r third_party/node/node_modules/@types/estree
       '';
 
     configurePhase = ''
